@@ -1,8 +1,11 @@
 //! High-level read-only Kopia repository reader: snapshots, directories, and Range object reads.
 
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::rc::Rc;
 
 use bytes::Bytes;
+use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{decompress_content, decompress_gzip, ContentCrypter};
@@ -293,9 +296,12 @@ impl<S: StorageReader> KopiaRepo<S> {
         }
     }
 
-    /// Reads an optional inclusive `ByteRange` of a file `DirEntry`, fetching only the
-    /// intersecting Kopia chunks.
-    pub async fn read_file_range(&self, entry: &DirEntry, range: Option<ByteRange>) -> Result<Bytes> {
+    /// Computes the ordered list of chunk slices required to satisfy `range`.
+    async fn plan_range_chunks(
+        &self,
+        entry: &DirEntry,
+        range: Option<ByteRange>,
+    ) -> Result<(u64, Vec<ChunkSliceTask>)> {
         if !entry.is_file() {
             return Err(KopiaError::InvalidFormat(format!(
                 "{} is not a regular file",
@@ -304,7 +310,7 @@ impl<S: StorageReader> KopiaRepo<S> {
         }
         let total_size = entry.size.unwrap_or(0);
         if total_size == 0 {
-            return Ok(Bytes::new());
+            return Ok((0, Vec::new()));
         }
 
         let target = match range {
@@ -323,14 +329,12 @@ impl<S: StorageReader> KopiaRepo<S> {
             },
         };
 
-        let object_id = entry
-            .obj
-            .as_deref()
-            .ok_or_else(|| KopiaError::InvalidFormat(format!("file {} missing obj ID", entry.name)))?;
+        let object_id = entry.obj.as_deref().ok_or_else(|| {
+            KopiaError::InvalidFormat(format!("file {} missing obj ID", entry.name))
+        })?;
 
         let chunks = self.resolve_object_chunks(object_id, total_size).await?;
-        let mut out = Vec::with_capacity(target.len() as usize);
-
+        let mut tasks = Vec::new();
         for chunk in chunks {
             if chunk.length == 0 {
                 continue;
@@ -339,23 +343,78 @@ impl<S: StorageReader> KopiaRepo<S> {
             if chunk_end < target.start || chunk.start > target.end {
                 continue;
             }
-
-            let data = self.read_content(&chunk.content_id).await?;
             let slice_start = target.start.saturating_sub(chunk.start) as usize;
             let slice_end = (target.end.min(chunk_end) - chunk.start) as usize + 1;
-            if slice_end > data.len() {
-                return Err(KopiaError::InvalidFormat(format!(
-                    "chunk {} shorter than expected: {} < {}",
-                    chunk.content_id,
-                    data.len(),
-                    slice_end
-                )));
-            }
-            out.extend_from_slice(&data[slice_start..slice_end]);
+            tasks.push(ChunkSliceTask {
+                content_id: chunk.content_id,
+                slice_start,
+                slice_end,
+            });
+        }
+
+        Ok((target.len(), tasks))
+    }
+
+    async fn fetch_chunk_slice(&self, task: ChunkSliceTask) -> Result<Vec<u8>> {
+        let data = self.read_content(&task.content_id).await?;
+        if task.slice_end > data.len() {
+            return Err(KopiaError::InvalidFormat(format!(
+                "chunk {} shorter than expected: {} < {}",
+                task.content_id,
+                data.len(),
+                task.slice_end
+            )));
+        }
+        Ok(data[task.slice_start..task.slice_end].to_vec())
+    }
+
+    /// Streams an optional inclusive `ByteRange` of a file `DirEntry` using a bounded
+    /// sliding-window concurrent fetch (`concurrency` chunks in flight, ordered output).
+    pub async fn stream_file_range(
+        repo: Rc<Self>,
+        entry: &DirEntry,
+        range: Option<ByteRange>,
+        concurrency: usize,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + 'static>>>
+    where
+        S: 'static,
+    {
+        let (_expected_len, tasks) = repo.plan_range_chunks(entry, range).await?;
+        let window = concurrency.max(1);
+        let s = stream::iter(tasks)
+            .map(move |task| {
+                let repo = Rc::clone(&repo);
+                async move { repo.fetch_chunk_slice(task).await }
+            })
+            .buffered(window);
+        Ok(Box::pin(s))
+    }
+
+    /// Reads an optional inclusive `ByteRange` of a file `DirEntry` into memory using
+    /// a bounded sliding-window concurrent fetch (`concurrency = 4`).
+    pub async fn read_file_range(&self, entry: &DirEntry, range: Option<ByteRange>) -> Result<Bytes> {
+        let (expected_len, tasks) = self.plan_range_chunks(entry, range).await?;
+        if tasks.is_empty() {
+            return Ok(Bytes::new());
+        }
+
+        let mut out = Vec::with_capacity(expected_len as usize);
+        let mut s = stream::iter(tasks)
+            .map(|task| self.fetch_chunk_slice(task))
+            .buffered(4);
+
+        while let Some(chunk) = s.next().await {
+            out.extend_from_slice(&chunk?);
         }
 
         Ok(Bytes::from(out))
     }
+}
+
+struct ChunkSliceTask {
+    content_id: ContentId,
+    slice_start: usize,
+    slice_end: usize,
 }
 
 fn normalize_object_content_id(object_id: &str) -> Result<ContentId> {

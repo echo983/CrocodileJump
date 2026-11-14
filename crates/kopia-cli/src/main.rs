@@ -210,7 +210,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let latest = snapshots.first().expect("expected at least 1 snapshot");
     println!("4. Verifying files in latest snapshot {}:", latest.id);
 
-    for rel_path in ["hello.txt", "sub/nested/info.json", "blob5m.bin"] {
+    for rel_path in ["hello.txt", "sub/nested/info.json", "blob5m.bin", "big12m.bin", "中文 测试.txt"] {
         let entry = repo.stat_path(&latest.id, rel_path).await?;
         let data = repo.read_file_range(&entry, None).await?;
         let local_path = Path::new("/tmp/kopia-test-data").join(rel_path);
@@ -227,20 +227,32 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("5. Verifying partial Range read on blob5m.bin [1048576..=1052671]...");
-    let blob_entry = repo.stat_path(&latest.id, "blob5m.bin").await?;
+    println!("5. Verifying cross-chunk partial Range read on big12m.bin...");
+    let big_entry = repo.stat_path(&latest.id, "big12m.bin").await?;
+    let obj_id = big_entry.obj.as_deref().unwrap();
+    let chunks = repo
+        .resolve_object_chunks(obj_id, big_entry.size.unwrap())
+        .await?;
+    println!("   big12m.bin obj={} ({} chunks)", obj_id, chunks.len());
+    assert!(chunks.len() >= 2, "expected big12m.bin to split into >= 2 chunks");
+    let boundary = chunks[0].length;
+    let cross_start = boundary.saturating_sub(2048);
+    let cross_end = (boundary + 2048).min(big_entry.size.unwrap() - 1);
     let slice = repo
         .read_file_range(
-            &blob_entry,
+            &big_entry,
             Some(ByteRange {
-                start: 1048576,
-                end: 1052671,
+                start: cross_start,
+                end: cross_end,
             }),
         )
         .await?;
-    let local_blob = std::fs::read("/tmp/kopia-test-data/blob5m.bin")?;
-    assert_eq!(slice.as_ref(), &local_blob[1048576..=1052671]);
-    println!("   [OK] Range read verified ({} bytes)", slice.len());
+    let local_big = std::fs::read("/tmp/kopia-test-data/big12m.bin")?;
+    assert_eq!(slice.as_ref(), &local_big[cross_start as usize..=cross_end as usize]);
+    println!(
+        "   [OK] Cross-chunk Range [{cross_start}..={cross_end}] verified ({} bytes)",
+        slice.len()
+    );
 
     Ok(())
 }

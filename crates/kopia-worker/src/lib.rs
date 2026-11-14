@@ -3,10 +3,12 @@ use std::rc::Rc;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use kopia_core::crypto::{ContentCrypter, KopiaRepositoryBlob, RepoFormat};
 use kopia_core::repo::KopiaRepo;
 use kopia_core::webdav::{parse_propfind_xml, shard_blob_path, DavEntry};
 use kopia_core::{BlobMeta, ByteRange, KopiaError, Result as KopiaResult, StorageReader};
+use percent_encoding::percent_decode_str;
 use worker::*;
 
 /// Maximum plain file size cached as a whole `200 OK` response in Cloudflare `caches.default`.
@@ -306,6 +308,13 @@ fn parse_range_header(header: Option<&str>, total_size: u64) -> RangeParse {
     RangeParse::Valid(ByteRange { start, end })
 }
 
+fn decode_rel_path(raw: &str) -> std::result::Result<String, String> {
+    percent_decode_str(raw)
+        .decode_utf8()
+        .map(|cow| cow.into_owned())
+        .map_err(|e| format!("invalid UTF-8 in path: {e}"))
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();
@@ -341,7 +350,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Err(e) => return Ok(map_kopia_err(e)),
     };
     let repo = match KopiaRepo::open(storage, crypter).await {
-        Ok(r) => r,
+        Ok(r) => Rc::new(r),
         Err(e) => return Ok(map_kopia_err(e)),
     };
 
@@ -358,7 +367,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     // Route: /s/<snapshot-id>/<rel-path> or /latest/<rel-path>
-    let (snapshot_id, rel_path, cache_control) = if let Some(rest) = path.strip_prefix("/s/") {
+    let (snapshot_id, raw_rel_path, cache_control) = if let Some(rest) = path.strip_prefix("/s/") {
         let (sid, rel) = match rest.split_once('/') {
             Some((s, r)) => (s.to_string(), r.to_string()),
             None => (rest.to_string(), String::new()),
@@ -383,6 +392,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
     } else {
         return Response::error("Not Found", 404);
+    };
+
+    let rel_path = match decode_rel_path(&raw_rel_path) {
+        Ok(p) => p,
+        Err(msg) => return Response::error(msg, 400),
     };
 
     let is_dir_listing = rel_path.is_empty() || rel_path.ends_with('/');
@@ -440,44 +454,65 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             Ok(resp)
         }
         RangeParse::Valid(byte_range) => {
-            let bytes = match repo.read_file_range(&entry, Some(byte_range)).await {
-                Ok(b) => b,
+            let stream = match KopiaRepo::stream_file_range(
+                Rc::clone(&repo),
+                &entry,
+                Some(byte_range),
+                4,
+            )
+            .await
+            {
+                Ok(s) => s,
                 Err(e) => return Ok(map_kopia_err(e)),
             };
-            let mut resp = Response::from_bytes(bytes.to_vec())?.with_status(206);
+            let mapped = stream.map_err(|e| Error::RustError(e.to_string()));
+            let mut resp = Response::from_stream(mapped)?.with_status(206);
             let h = resp.headers_mut();
             h.set(
                 "Content-Range",
                 &format!("bytes {}-{}/{total_size}", byte_range.start, byte_range.end),
             )?;
-            h.set("Content-Length", &bytes.len().to_string())?;
+            h.set("Content-Length", &byte_range.len().to_string())?;
             h.set("Accept-Ranges", "bytes")?;
             h.set("ETag", &etag)?;
             h.set("Cache-Control", cache_control)?;
             Ok(resp)
         }
         RangeParse::None => {
-            let bytes = match repo.read_file_range(&entry, None).await {
-                Ok(b) => b,
-                Err(e) => return Ok(map_kopia_err(e)),
-            };
-            let mut resp = Response::from_bytes(bytes.to_vec())?.with_status(200);
-            let h = resp.headers_mut();
-            h.set("Content-Length", &bytes.len().to_string())?;
-            h.set("Accept-Ranges", "bytes")?;
-            h.set("ETag", &etag)?;
-            h.set("Cache-Control", cache_control)?;
-
-            // Cache full 200 OK plain responses up to MAX_CACHEABLE_FILE_BYTES on immutable routes.
             if is_immutable_route && total_size <= MAX_CACHEABLE_FILE_BYTES {
+                let bytes = match repo.read_file_range(&entry, None).await {
+                    Ok(b) => b,
+                    Err(e) => return Ok(map_kopia_err(e)),
+                };
+                let mut resp = Response::from_bytes(bytes.to_vec())?.with_status(200);
+                let h = resp.headers_mut();
+                h.set("Content-Length", &bytes.len().to_string())?;
+                h.set("Accept-Ranges", "bytes")?;
+                h.set("ETag", &etag)?;
+                h.set("Cache-Control", cache_control)?;
+
                 if let Ok(cloned) = resp.cloned() {
                     let req_url = url.to_string();
                     ctx_rc.wait_until(async move {
                         let _ = Cache::default().put(&req_url, cloned).await;
                     });
                 }
+                Ok(resp)
+            } else {
+                let stream =
+                    match KopiaRepo::stream_file_range(Rc::clone(&repo), &entry, None, 4).await {
+                        Ok(s) => s,
+                        Err(e) => return Ok(map_kopia_err(e)),
+                    };
+                let mapped = stream.map_err(|e| Error::RustError(e.to_string()));
+                let mut resp = Response::from_stream(mapped)?.with_status(200);
+                let h = resp.headers_mut();
+                h.set("Content-Length", &total_size.to_string())?;
+                h.set("Accept-Ranges", "bytes")?;
+                h.set("ETag", &etag)?;
+                h.set("Cache-Control", cache_control)?;
+                Ok(resp)
             }
-            Ok(resp)
         }
     }
 }
@@ -485,6 +520,19 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_rel_path() {
+        assert_eq!(
+            decode_rel_path("%E4%B8%AD%E6%96%87%20%E6%B5%8B%E8%AF%95.txt").unwrap(),
+            "中文 测试.txt"
+        );
+        assert_eq!(
+            decode_rel_path("sub/nested/info.json").unwrap(),
+            "sub/nested/info.json"
+        );
+        assert!(decode_rel_path("%FF%FE").is_err());
+    }
 
     #[test]
     fn test_parse_range_header() {
