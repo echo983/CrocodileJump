@@ -1,11 +1,14 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
+use futures_util::future::join_all;
 use futures_util::TryStreamExt;
 use kopia_core::crypto::{ContentCrypter, KopiaRepositoryBlob, RepoFormat};
-use kopia_core::repo::KopiaRepo;
+use kopia_core::index::MergedIndex;
+use kopia_core::repo::{KopiaRepo, SnapshotInfo};
 use kopia_core::webdav::{parse_propfind_xml, shard_blob_path, DavEntry};
 use kopia_core::{BlobMeta, ByteRange, KopiaError, Result as KopiaResult, StorageReader};
 use percent_encoding::percent_decode_str;
@@ -13,6 +16,24 @@ use worker::*;
 
 /// Maximum plain file size cached as a whole `200 OK` response in Cloudflare `caches.default`.
 const MAX_CACHEABLE_FILE_BYTES: u64 = 20 * 1024 * 1024;
+/// Isolate & edge metadata cache TTL for mutable index/snapshot listings (30 seconds).
+const METADATA_CACHE_TTL_MS: f64 = 30_000.0;
+
+struct CachedIndex {
+    expires_at_ms: f64,
+    index: Rc<MergedIndex>,
+}
+
+struct CachedSnapshots {
+    expires_at_ms: f64,
+    snapshots: Vec<SnapshotInfo>,
+}
+
+thread_local! {
+    static CRYPTER_CACHE: RefCell<Option<ContentCrypter>> = const { RefCell::new(None) };
+    static INDEX_CACHE: RefCell<Option<CachedIndex>> = const { RefCell::new(None) };
+    static SNAPSHOTS_CACHE: RefCell<Option<CachedSnapshots>> = const { RefCell::new(None) };
+}
 
 struct WorkerWebDavStorage {
     base_url: String,
@@ -111,7 +132,16 @@ impl WorkerWebDavStorage {
 #[async_trait(?Send)]
 impl StorageReader for WorkerWebDavStorage {
     async fn list_blobs(&self, prefix: &str) -> KopiaResult<Vec<BlobMeta>> {
-        let mut results = Vec::new();
+        let cache = Cache::default();
+        let cache_key = format!("https://kopia-cache.internal/list/{prefix}");
+        if let Ok(Some(mut cached)) = cache.get(&cache_key, false).await {
+            if let Ok(bytes) = cached.bytes().await {
+                if let Ok(list) = serde_json::from_slice::<Vec<BlobMeta>>(&bytes) {
+                    return Ok(list);
+                }
+            }
+        }
+
         let first_char = prefix
             .chars()
             .next()
@@ -126,17 +156,24 @@ impl StorageReader for WorkerWebDavStorage {
             .collect::<Vec<_>>()
             .join("/");
 
+        let mut subdirs = Vec::new();
         for d in level1 {
             if !d.is_dir {
                 continue;
             }
-            let dir_name = d.href.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let dir_name = d.href.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
             let sub_prefix = format!("{first_char}{dir_name}");
             if !sub_prefix.starts_with(prefix) && !prefix.starts_with(&sub_prefix) {
                 continue;
             }
             let level2_url = format!("{scheme_host}{}", d.href);
-            for f in self.propfind_dir(&level2_url).await? {
+            subdirs.push((dir_name, level2_url));
+        }
+
+        let level2_results = join_all(subdirs.iter().map(|(_, u)| self.propfind_dir(u))).await;
+        let mut results = Vec::new();
+        for ((dir_name, _), res) in subdirs.into_iter().zip(level2_results) {
+            for f in res? {
                 if f.is_dir {
                     continue;
                 }
@@ -150,6 +187,17 @@ impl StorageReader for WorkerWebDavStorage {
                         });
                     }
                 }
+            }
+        }
+
+        if let Ok(json_bytes) = serde_json::to_vec(&results) {
+            if let Ok(mut resp) = Response::from_bytes(json_bytes) {
+                let _ = resp
+                    .headers_mut()
+                    .set("Cache-Control", "public, max-age=30");
+                self.ctx.wait_until(async move {
+                    let _ = Cache::default().put(&cache_key, resp).await;
+                });
             }
         }
 
@@ -315,6 +363,69 @@ fn decode_rel_path(raw: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("invalid UTF-8 in path: {e}"))
 }
 
+async fn get_or_init_crypter(
+    env: &Env,
+    storage: &WorkerWebDavStorage,
+) -> KopiaResult<ContentCrypter> {
+    if let Some(c) = CRYPTER_CACHE.with(|cell| cell.borrow().clone()) {
+        return Ok(c);
+    }
+    let format = load_format(env, storage).await?;
+    let crypter = ContentCrypter::from_format(&format)?;
+    CRYPTER_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some(crypter.clone());
+    });
+    Ok(crypter)
+}
+
+async fn get_or_open_repo(
+    storage: WorkerWebDavStorage,
+    crypter: ContentCrypter,
+) -> KopiaResult<Rc<KopiaRepo<WorkerWebDavStorage>>> {
+    let now = js_sys::Date::now();
+    if let Some(cached_idx) = INDEX_CACHE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|c| c.expires_at_ms > now)
+            .map(|c| Rc::clone(&c.index))
+    }) {
+        return Ok(Rc::new(KopiaRepo::from_index(storage, crypter, cached_idx)));
+    }
+
+    let repo = Rc::new(KopiaRepo::open(storage, crypter).await?);
+    let idx = repo.index();
+    INDEX_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some(CachedIndex {
+            expires_at_ms: js_sys::Date::now() + METADATA_CACHE_TTL_MS,
+            index: idx,
+        });
+    });
+    Ok(repo)
+}
+
+async fn get_or_list_snapshots(
+    repo: &KopiaRepo<WorkerWebDavStorage>,
+) -> KopiaResult<Vec<SnapshotInfo>> {
+    let now = js_sys::Date::now();
+    if let Some(snaps) = SNAPSHOTS_CACHE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|c| c.expires_at_ms > now)
+            .map(|c| c.snapshots.clone())
+    }) {
+        return Ok(snaps);
+    }
+
+    let snaps = repo.list_snapshots().await?;
+    SNAPSHOTS_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some(CachedSnapshots {
+            expires_at_ms: js_sys::Date::now() + METADATA_CACHE_TTL_MS,
+            snapshots: snaps.clone(),
+        });
+    });
+    Ok(snaps)
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.method();
@@ -325,10 +436,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().to_string();
 
-    // 1. Check Cloudflare Cache API first for immutable `/s/<id>/...` routes.
+    // 1. Check Cloudflare Cache API first for immutable `/s/<id>/...` routes and `/_snapshots`.
     let cache = Cache::default();
     let is_immutable_route = path.starts_with("/s/");
-    if is_immutable_route {
+    if is_immutable_route || path == "/_snapshots" {
         if let Ok(Some(hit)) = cache.get(&req, false).await {
             return Ok(hit);
         }
@@ -341,55 +452,55 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let ctx_rc = Rc::new(ctx);
     let storage = WorkerWebDavStorage::new(webdav_url, &webdav_user, &webdav_pass, ctx_rc.clone());
 
-    let format = match load_format(&env, &storage).await {
-        Ok(f) => f,
-        Err(e) => return Ok(map_kopia_err(e)),
-    };
-    let crypter = match ContentCrypter::from_format(&format) {
+    let crypter = match get_or_init_crypter(&env, &storage).await {
         Ok(c) => c,
         Err(e) => return Ok(map_kopia_err(e)),
     };
-    let repo = match KopiaRepo::open(storage, crypter).await {
-        Ok(r) => Rc::new(r),
+    let repo = match get_or_open_repo(storage, crypter).await {
+        Ok(r) => r,
         Err(e) => return Ok(map_kopia_err(e)),
     };
 
     // Route: GET /_snapshots
     if path == "/_snapshots" {
-        let snapshots = match repo.list_snapshots().await {
+        let snapshots = match get_or_list_snapshots(&repo).await {
             Ok(s) => s,
             Err(e) => return Ok(map_kopia_err(e)),
         };
         let mut resp = Response::from_json(&snapshots)?;
         resp.headers_mut()
             .set("Cache-Control", "public, max-age=30")?;
+        if method == Method::Get {
+            if let Ok(cloned) = resp.cloned() {
+                let req_url = url.to_string();
+                ctx_rc.wait_until(async move {
+                    let _ = Cache::default().put(&req_url, cloned).await;
+                });
+            }
+        }
         return Ok(resp);
     }
 
+    let snapshots = match get_or_list_snapshots(&repo).await {
+        Ok(s) => s,
+        Err(e) => return Ok(map_kopia_err(e)),
+    };
+
     // Route: /s/<snapshot-id>/<rel-path> or /latest/<rel-path>
-    let (snapshot_id, raw_rel_path, cache_control) = if let Some(rest) = path.strip_prefix("/s/") {
+    let (target_snap, raw_rel_path, cache_control) = if let Some(rest) = path.strip_prefix("/s/") {
         let (sid, rel) = match rest.split_once('/') {
-            Some((s, r)) => (s.to_string(), r.to_string()),
-            None => (rest.to_string(), String::new()),
+            Some((s, r)) => (s, r.to_string()),
+            None => (rest, String::new()),
         };
-        (
-            sid,
-            rel,
-            "public, max-age=31536000, immutable",
-        )
+        let Some(snap) = snapshots.iter().find(|s| s.id == sid) else {
+            return Response::error(format!("snapshot not found: {sid}"), 404);
+        };
+        (snap, rel, "public, max-age=31536000, immutable")
     } else if let Some(rest) = path.strip_prefix("/latest/") {
-        let snapshots = match repo.list_snapshots().await {
-            Ok(s) => s,
-            Err(e) => return Ok(map_kopia_err(e)),
-        };
         let Some(latest) = snapshots.first() else {
             return Response::error("no snapshots found", 404);
         };
-        (
-            latest.id.clone(),
-            rest.to_string(),
-            "public, max-age=60",
-        )
+        (latest, rest.to_string(), "public, max-age=60")
     } else {
         return Response::error("Not Found", 404);
     };
@@ -400,7 +511,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     };
 
     let is_dir_listing = rel_path.is_empty() || rel_path.ends_with('/');
-    let entry = match repo.stat_path(&snapshot_id, &rel_path).await {
+    let entry = match repo.stat_path_in_snapshot(target_snap, &rel_path).await {
         Ok(e) => e,
         Err(e) => return Ok(map_kopia_err(e)),
     };

@@ -2,5 +2,9 @@ name = "crocodile-jump-kopia"
 main = "build/worker/shim.mjs"
 compatibility_date = "2025-04-01"
 
+# Production note: when consumed exclusively by an upstream Worker via Service Bindings,
+# set `workers_dev = false` below to disable public *.workers.dev access.
+# workers_dev = false
+
 [build]
 command = "bash ./build.sh"

@@ -10,6 +10,7 @@ pub mod webdav;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors returned by Kopia repository parsing and storage operations.
@@ -37,7 +38,7 @@ pub enum KopiaError {
 pub type Result<T> = std::result::Result<T, KopiaError>;
 
 /// Metadata for a raw blob stored in the underlying backend (e.g. WebDAV or local FS).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub id: String,
     pub length: u64,

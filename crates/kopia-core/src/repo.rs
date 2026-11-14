@@ -105,26 +105,49 @@ pub struct ObjectChunk {
 pub struct KopiaRepo<S: StorageReader> {
     storage: S,
     crypter: ContentCrypter,
-    index: MergedIndex,
+    index: Rc<MergedIndex>,
 }
 
 impl<S: StorageReader> KopiaRepo<S> {
-    /// Opens a repository by loading and merging all `xn*` index shards.
+    /// Constructs a `KopiaRepo` from a pre-loaded `MergedIndex` (e.g. Isolate cache).
+    pub fn from_index(storage: S, crypter: ContentCrypter, index: Rc<MergedIndex>) -> Self {
+        Self {
+            storage,
+            crypter,
+            index,
+        }
+    }
+
+    /// Returns a shared handle to the merged index.
+    pub fn index(&self) -> Rc<MergedIndex> {
+        Rc::clone(&self.index)
+    }
+
+    /// Opens a repository by concurrently loading and merging all `xn*` index shards.
     pub async fn open(storage: S, crypter: ContentCrypter) -> Result<Self> {
         let blobs = storage.list_blobs("xn").await?;
         let mut index = MergedIndex::default();
 
-        for blob in blobs {
-            let encrypted = storage.read_blob(&blob.id).await?;
-            let decrypted = crypter.decrypt_index_blob(&blob.id, &encrypted)?;
-            let shard = IndexV2::parse(decrypted)?;
-            index.merge_shard(&shard)?;
+        {
+            let storage_ref = &storage;
+            let crypter_ref = &crypter;
+            let mut shards_stream = stream::iter(blobs)
+                .map(|blob| async move {
+                    let encrypted = storage_ref.read_blob(&blob.id).await?;
+                    let decrypted = crypter_ref.decrypt_index_blob(&blob.id, &encrypted)?;
+                    IndexV2::parse(decrypted)
+                })
+                .buffered(6);
+
+            while let Some(shard) = shards_stream.next().await {
+                index.merge_shard(&shard?)?;
+            }
         }
 
         Ok(Self {
             storage,
             crypter,
-            index,
+            index: Rc::new(index),
         })
     }
 
@@ -149,18 +172,28 @@ impl<S: StorageReader> KopiaRepo<S> {
         decompress_content(entry.compression_header_id, &decrypted)
     }
 
-    /// Lists all snapshots in the repository, sorted newest-first by `start_time`.
+    /// Lists all snapshots in the repository concurrently, sorted newest-first by `start_time`.
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
-        let manifest_entries = self.index.list_with_prefix(b'm');
+        let manifest_entries: Vec<_> = self
+            .index
+            .list_with_prefix(b'm')
+            .into_iter()
+            .map(|e| e.content_id.clone())
+            .collect();
         let mut snapshots = Vec::new();
 
-        for entry in manifest_entries {
-            let raw = self.read_content(&entry.content_id).await?;
-            let json_bytes = decompress_gzip(&raw)?;
-            let blob: ManifestBlob = serde_json::from_slice(&json_bytes).map_err(|e| {
-                KopiaError::InvalidFormat(format!("invalid manifest JSON: {e}"))
-            })?;
+        let mut manifest_stream = stream::iter(manifest_entries)
+            .map(|cid| async move {
+                let raw = self.read_content(&cid).await?;
+                let json_bytes = decompress_gzip(&raw)?;
+                serde_json::from_slice::<ManifestBlob>(&json_bytes).map_err(|e| {
+                    KopiaError::InvalidFormat(format!("invalid manifest JSON: {e}"))
+                })
+            })
+            .buffered(6);
 
+        while let Some(res) = manifest_stream.next().await {
+            let blob = res?;
             for item in blob.entries {
                 let is_snapshot = item
                     .labels
@@ -228,11 +261,15 @@ impl<S: StorageReader> KopiaRepo<S> {
     pub async fn stat_path(&self, snapshot_id: &str, path: &str) -> Result<DirEntry> {
         let snapshots = self.list_snapshots().await?;
         let snap = snapshots
-            .into_iter()
+            .iter()
             .find(|s| s.id == snapshot_id)
             .ok_or_else(|| KopiaError::NotFound(format!("snapshot not found: {snapshot_id}")))?;
+        self.stat_path_in_snapshot(snap, path).await
+    }
 
-        let mut current = snap.root_entry;
+    /// Resolves a relative path within an already-loaded `SnapshotInfo`.
+    pub async fn stat_path_in_snapshot(&self, snap: &SnapshotInfo, path: &str) -> Result<DirEntry> {
+        let mut current = snap.root_entry.clone();
         let trimmed = path.trim_matches('/');
         if trimmed.is_empty() {
             return Ok(current);
