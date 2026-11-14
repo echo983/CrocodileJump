@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kopia-core",
+    "crates/kopia-cli",
+    "crates/kopia-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+quick-xml = "0.37"
+ruzstd = "0.7"
+scrypt = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"

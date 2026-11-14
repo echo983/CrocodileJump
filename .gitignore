@@ -1,0 +1,6 @@
+/target/
+/secret/
+/crates/kopia-worker/build/
+.wrangler/
+.dev.vars
+Cargo.lock

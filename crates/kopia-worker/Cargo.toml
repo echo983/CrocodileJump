@@ -1,0 +1,18 @@
+[package]
+name = "kopia-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+getrandom = { version = "0.2", features = ["js"] }
+kopia-core = { path = "../kopia-core" }
+serde_json.workspace = true
+web-sys = { version = "0.3", features = ["Headers", "Request", "RequestInit"] }
+worker = "0.5"

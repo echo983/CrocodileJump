@@ -1,0 +1,97 @@
+---
+
+## 一、 核心业务意图与应用场景
+
+1. **核心诉求**：
+* 拥有一个具备**内容定义分块去重（CDC）**、**强加密**、**多版本快照**能力的高性价比存储后端。
+* 写入端开箱即用，依赖成熟稳定的官方备份客户端；读取端完全**无客户端化（Clientless）**，通过标准 HTTP 协议按需提取文件，甚至直接作为**支持原子发布与瞬时回滚的静态网站/资源托管引擎**。
+
+
+2. **最终硬件与平台边界**：
+* **计算与网关层**：Cloudflare Workers **付费版（Paid Plan）**（单次请求支持最高 30s CPU 时间、1,000 个子请求、10MB 压缩包体积上限、128MB 内存上限）。
+* **持久化存储层**：部署在**欧洲专业机房**的独立 WebDAV 服务端（具备低 RTT 延迟、高并发带宽及标准 HTTP `Range` 分段读取支持）。
+
+
+
+---
+
+## 二、 技术选型演进与最终拍板
+
+在对比了 `rustic/restic`、`SquashFS`、自研 `fastcdc` CAS 和 `Kopia` 后，我们确定了最终的双端解耦架构：
+
+| 架构层级 | 最终选型 | 选型决策理由 |
+| --- | --- | --- |
+| **备份写入端** | **官方 Kopia**（CLI 或 KopiaUI，零代码修改） | 1. 原生支持 WebDAV 后端与 CDC 滚动分块去重（`DYNAMIC-4M-BUZHASH` 或 `1M`）。<br>
+
+<br>2. 分片有序索引（`xn*` 文件）机制极其先进，不像 restic/rustic 那样需要读取端在内存中全量合并所有索引文件，彻底规避百万级文件仓库在 Worker 上触发 128MB 内存溢出（OOM）的风险。 |
+| **边缘读取端** | **纯 Rust 编写的精简只读解析器**（编译为 `wasm32-unknown-unknown`） | 1. 放弃直接将 Go 版 Kopia 编译为 Wasm（避免 Go Runtime 带来的 ~20MB 体积超限及 GC 触发 OOM）。<br>
+
+<br>2. 仅实现只读协议解析（剥离写入、去重、GC 逻辑），Rust 编译产物压缩后仅 **300KB – 500KB**，无 GC 开销，内存恒定在 **3MB – 15MB**，冷启动 < 1ms。 |
+| **网络传输协议** | **标准 HTTP WebDAV**（`PROPFIND` + `GET Range`） | 无需引入繁重的云厂商专用签名 SDK（如 AWS S3 V4 签名），Worker 原生 `fetch` API 配合 Basic Auth 即可完成列目录与按字节区间精准拉取数据包片段。 |
+
+---
+
+## 三、 仓库算法锁定与纯 Rust 零 C 依赖栈
+
+为确保官方 Kopia 写入的数据能被 Rust Wasm 无障碍解析，写入端初始化时锁定标准算法，读取端全部选用 **100% 纯 Rust（无 C 语言 FFI 绑定）** 的 Crate，保证 Wasm 交叉编译零障碍：
+
+| 功能模块 | Kopia 仓库锁定配置 | Rust 读取端对应 Crate（纯 Rust） |
+| --- | --- | --- |
+| **运行时与网络** | WebDAV 协议接口 | `worker` (`workers-rs`) |
+| **加密与校验** | `AES256-GCM-HMAC-SHA256` 或 `CHACHA20-POLY1305-HMAC-SHA256` | `aes-gcm` / `chacha20poly1305`、`hmac`、`sha2`、`pbkdf2` / `scrypt` |
+| **数据压缩** | `zstd` 或 `s2` | `ruzstd`（纯 Rust 解压，替代 `zstd-sys`）或 `snap` |
+| **分块策略** | `DYNAMIC-4M-BUZHASH`（或 `1M`） | *读取端无需分块计算，仅按索引偏移量顺序拼接* |
+| **协议与序列化** | JSON 元数据 + 二进制索引 + XML 目录列表 | `serde`、`serde_json`、`quick-xml`、`mime_guess`（静态站 MIME 映射） |
+
+---
+
+## 四、 核心工作流与滑动窗口流式架构
+
+```
+[HTTP 请求: GET /path/to/file 或网页路由]
+       │
+       ▼
+  1. 边缘整文件缓存 ──► 查询 Cloudflare Cache API (URL 级) ──► 命中则直接 0ms 返回（不进 Wasm）
+       │ (未命中)
+       ▼
+  2. 密钥与仓库配置 ──► 从 Wasm 全局内存 (OnceLock) 获取 Master Key 与 kopia.repository 配置
+       │
+       ▼
+  3. 索引与目录解析 ──► 查 Cache API / WebDAV PROPFIND 获取 xn* 索引分片 ──► 二分查找定位目标 ContentID
+       │                 逐层解析 DirectoryEntry 拿到文件的 Chunk 列表及 (Pack文件, Offset, Length)
+       ▼
+  4. 并发拉取与流式输出 ► 利用 Paid 版 1000 子请求配额，以 3~5 块滑动窗口并发发起 WebDAV Range 请求
+                         解密解压后按序写入 TransformStream ──► 实时流式响应客户端 + 后台写入 Cache API
+
+```
+
+---
+
+## 五、 资源消耗与性能表现预期（Paid 版 + 欧洲机房）
+
+1. **极低网络延迟**：Cloudflare 欧洲边缘节点（FRA/AMS/CDG/MAD 等）与欧洲机房 WebDAV 之间的回源 RTT 仅 **5ms – 20ms**，彻底消除家用宽带瓶颈。
+2. **极低内存与 CPU 占用**：
+* 单次冷启动解析索引与目录仅消耗 **< 10MB RAM** 和 **2ms – 5ms CPU 时间**（远低于 128MB 内存和 30s CPU 上限）。
+* 热点文件与静态网页资源通过 `Cache API` 缓存在边缘节点，二次访问对 WebDAV 源站实现 **零回源 I/O**。
+
+
+3. **多功能复用能力**：同一套底层引擎既可以作为**私有加密网盘的在线浏览器/下载器**，也可以通过添加 `index.html` 自动补全和 `mime_guess` 响应头，直接承载**具备版本历史与秒级回滚能力的静态网站**。
+
+---
+
+## 六、 工程落地实施路线
+
+1. **阶段一：备份端仓库初始化**
+* 在本地/服务器使用官方 Kopia CLI 连接欧洲机房 WebDAV，指定固定加密（`AES256-GCM-HMAC-SHA256`）与压缩（`zstd`）参数创建仓库并推送测试数据。
+
+
+2. **阶段二：Kopia 格式解析核心（纯 Rust 库）**
+* 初始化 `workers-rs` 项目，实现 `kopia.repository` 密钥派生与解密、`xn*` 二进制索引分片解析与二分查找、`p*` 数据包解密解压逻辑。
+
+
+3. **阶段三：WebDAV 适配器与边缘缓存接入**
+* 编写 `PROPFIND` 列目录与 `GET + Range` 并发滑动窗口下载器，接入 `caches.default`（将解密后的明文包装为 `200 OK` 响应异步缓存）。
+
+
+4. **阶段四：路由网关与场景封装**
+* 根据需求挂载静态网站路由（自动补全 `index.html`、注入 `Content-Type`、支持 URL 指定历史 Snapshot 预览）或文件目录浏览 API。

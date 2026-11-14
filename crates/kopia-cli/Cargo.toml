@@ -1,0 +1,15 @@
+[package]
+name = "kopia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+hex.workspace = true
+kopia-core = { path = "../kopia-core" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
