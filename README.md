@@ -2,13 +2,14 @@
 
 基于 Cloudflare Workers（纯 Rust Wasm）的只读基础设施层存储网关，用于将远端 WebDAV 上的官方 [Kopia](https://kopia.io/) 加密去重仓库暴露为支持标准 HTTP `Range` 与边缘长效缓存的只读 HTTP 接口。
 
-* 架构设计详见 [docs/architecture.md](docs/architecture.md)。
+* 架构设计详见 [docs/architecture.md](docs/architecture.md)
+* 使用与部署指南详见 [docs/usage.md](docs/usage.md)
 
 ## 工程结构
 
-* `crates/kopia-core`：100% 纯 Rust（零 C FFI）的 Kopia 只读协议解析库，支持 `kopia.repository` 解密、`IndexV2` 二进制索引解析与合并、`AES256-GCM-HMAC-SHA256`、`zstd`（`ruzstd`）与 `gzip`（`flate2` `rust_backend`）解压，以及精确字节区间 `Range` 读取。
+* `crates/kopia-core`：100% 纯 Rust（零 C FFI）的 Kopia 只读协议解析库，支持 `kopia.repository` 解密、`IndexV2` 二进制索引解析与并发合并、`AES256-GCM-HMAC-SHA256`、`zstd`（`ruzstd`）与 `gzip`（`flate2` `rust_backend`）解压，以及 4 路滑动窗口并发流式 `Range` 读取。
 * `crates/kopia-cli`：本地命令行验证工具（对接 WebDAV 测试与导出 `KOPIA_FORMAT_JSON`）。
-* `crates/kopia-worker`：Cloudflare Workers 入口，集成 WebDAV `StorageReader` 与 `caches.default` 长效缓存。
+* `crates/kopia-worker`：Cloudflare Workers 入口，集成 WebDAV `StorageReader`、Isolate 内存 + `caches.default` 多级缓存、UTF-8 路径 percent-decoding 与 `Response::from_stream` 流式透传。
 
 ## HTTP API
 

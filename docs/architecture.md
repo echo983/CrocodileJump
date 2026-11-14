@@ -76,10 +76,10 @@ CrocodileJump/
      4. `p*` Pack 数据包按 `Offset + Length` 精准拉取、解密与 `ruzstd` 解压；
      5. 跨多 Chunk 的任意 `Range` 字节区间精确切片拼接。
    * 通过 `kopia-cli` 与原文件进行逐字节（SHA-256）一致性比对。
-2. **阶段二：`kopia-worker` 接入 WebDAV 与 Cloudflare Workers（已完成基础网关并本地验证）**
-   * 实现基于 `worker::Fetch` + `PROPFIND` + `GET Range` 的 `StorageReader`（复用 `kopia_core::webdav`）。
-   * 接入 `caches.default`（缓存 `xn*` 索引分片、目录 JSON 及 `<= 20MB` 小文件明文 `200 OK`）。
-   * 实现标准 `GET` / `HEAD` / `Range`（`206` / `416`）与 `ETag` / `immutable` 缓存头，gzip 压缩后 `.wasm` 体积约 `338KB`。
-   * 后续按需增强：多 Chunk 并发滑动窗口流式输出（`TransformStream`）、URL percent-decoding。
-3. **阶段三：压测与上层 Service Binding 联调**
-   * 在 Cloudflare Paid Plan 环境下验证冷启动内存、CPU 时间、1000 子请求边界及大文件 Range 流式稳定性。
+2. **阶段二：`kopia-worker` 接入 WebDAV 与 Cloudflare Workers（已完成）**
+   * 实现基于 `worker::Fetch` + 并发 `PROPFIND` + `GET Range` 的 `StorageReader`（复用 `kopia_core::webdav`）。
+   * 接入 Isolate 内存（30s TTL）+ `caches.default` 多级缓存（缓存 `PROPFIND` 列表、`xn*` 索引分片、`/_snapshots`、目录 JSON 及 `<= 20MB` 小文件明文 `200 OK`）。
+   * 实现 4 路滑动窗口并发拉取 + `Response::from_stream` 流式输出、UTF-8 路径 percent-decoding，以及标准 `GET` / `HEAD` / `Range`（`206` / `416`）与 `ETag` / `immutable` 缓存头，gzip 压缩后 `.wasm` 体积约 `376 KiB`。
+3. **阶段三：边缘实测与上层 Service Binding 集成（已完成核心边缘验证）**
+   * 已部署至 Cloudflare Workers 真实边缘节点完成 12MB 多 Chunk 间接对象流式下载、跨 Chunk `Range` 拼接、中文空格路径及边缘缓存命中延迟验证（缓存命中 ~180ms）。
+   * 集成指南详见 [docs/usage.md](usage.md)。
